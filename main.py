@@ -6,7 +6,8 @@ import torch
 from torch.utils.data import DataLoader, sampler
 from datum import trainset, testset
 
-from model import SoftDecisionTree
+# from model import SoftDecisionTree
+from newmodel import SoftDecisionTree
 
 # Training settings
 parser = argparse.ArgumentParser(description='PyTorch MNIST Example')
@@ -75,7 +76,9 @@ model = SoftDecisionTree(args)
 if args.cuda:
     model.cuda()
 
-for epoch in range(1, args.epochs + 1):
-    model.train_(train_loader, epoch)
-    model.test_(test_loader, epoch)
-# save_result()
+# for epoch in range(1, args.epochs + 1):
+#     model.train_(train_loader, epoch)
+#     model.test_(test_loader, epoch)
+
+for epoch in range(args.epochs):
+    print('')

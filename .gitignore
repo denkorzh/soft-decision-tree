@@ -1,2 +1,6 @@
 data/*
 result/*
+.idea/
+.ipynb_checkpoints/
+*___jb_tmp___
+__pycache__/
