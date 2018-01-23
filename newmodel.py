@@ -6,6 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import torch.optim.lr_scheduler as lrs
+import numpy as np
 from torch.autograd import Variable
 from sklearn.metrics import roc_auc_score
 
@@ -32,19 +33,20 @@ class LeafNode(Node):
     def __init__(self, args):
         super(LeafNode, self).__init__()
         self.args = args
-        self.classes_dist = nn.Parameter(torch.randn(self.args.output_dim))
+        self.classes_ratio = nn.Parameter(torch.randn(self.args.output_dim))
         if self.args.cuda:
-            self.classes_dist.cuda()
+            self.classes_ratio.cuda()
         self.leaf = True
         self.softmax = nn.Softmax()
 
     def forward(self, *x):
-        return self.softmax(self.classes_ratio.view(1, -1))  # bs x c
+        return self.softmax(self.classes_ratio.view(1, -1))  # 1 x c
 
     def get_probs(self, x, path_prob):
         """Get the probability of visiting the node and classes distribution"""
         self.path_prob = path_prob
-        classes_dist = self.forward()
+        classes_dist_per_object = self.forward()  # 1 x c
+        classes_dist = classes_dist_per_object.expand(x.size()[0], classes_dist_per_object.size()[1])
         return [(path_prob, classes_dist)]  # path_prob: bs x 1, classes_dist: bs x c
 
 
@@ -73,7 +75,7 @@ class InnerNode(Node):
         """Get the probabilities of visiting and respective classes distributions
         of all the leaves in the respective subtree"""
         self.path_prob = path_prob
-        self.go_right_prob = self.forward(x)
+        self.go_right_prob = nn.Sigmoid()(self.forward(x))
         subtree_leaves_probs = list()
         subtree_leaves_probs.extend(self
                                     ._modules['left_child']
@@ -100,16 +102,19 @@ class SoftDecisionTree(nn.Module):
         super(SoftDecisionTree, self).__init__()
         self.args = args
         self.root = InnerNode(1, self.args)
-        self.alpha = nn.Parameter(torch.FloatTensor([0.01]))
+        # self.alpha = nn.Parameter(torch.FloatTensor([0.001]))
+        self.alpha = self.args.l1_const
         self.bn = nn.BatchNorm1d(self.args.input_dim)
         self.train_mode = False
 
         self.optimizer = optim.SGD(self.parameters(), lr=self.args.lr, momentum=self.args.momentum)
-        self.scheduler = lrs.ReduceLROnPlateau(self.optimizer, factor=0.9, patience=50, verbose=True)
-        # self.scheduler = None
+        # self.scheduler = lrs.ReduceLROnPlateau(self.optimizer, factor=0.9, patience=50, verbose=True, cooldown=50)
+        self.scheduler = None
 
         self.layers = nn.ModuleList()
         self.collect_layers()
+
+        self.prev_parameters = list()  # TODO: remove after debugging
 
     def collect_layers(self):
         """Collect all Linear layers in the soft tree to one ModuleList"""
@@ -125,9 +130,9 @@ class SoftDecisionTree(nn.Module):
     def get_probs(self, x):
         """Get the probabilities of visiting and respective classes distributions
         of all the leaves in the soft tree"""
-        visit_root_prob = torch.ones(x.size()[0], 1)
+        visit_root_prob = nn.Parameter(torch.ones(x.size()[0], 1).cuda(), requires_grad=False)
         leaves_probs = self.root.get_probs(x, visit_root_prob)  # [(bs x 1, bs x c), ...]
-        leaves_probs = list(*leaves_probs)  # [(bs x 1, bs x 1, ...), (bs x c, bs x c, ...)]
+        leaves_probs = list(zip(*leaves_probs))  # [(bs x 1, bs x 1, ...), (bs x c, bs x c, ...)]
         paths_probs = torch.stack(leaves_probs[0], dim=1)  # bs x numleaves x 1
         dists = torch.stack(leaves_probs[1], dim=1)  # bs x numleaves x c
         return paths_probs, dists
@@ -141,17 +146,18 @@ class SoftDecisionTree(nn.Module):
         :param distribs: distributions of classes in the leaves (bs x numleaves x c)
         :return:
         """
-        assert ((x is not None) ^ (paths_probs is not None and distribs is not None),
+        assert ((x is not None) != (paths_probs is not None and distribs is not None),
                 'One of x and leaves_probs should be provided')
         if paths_probs is None:
             paths_probs, distribs = self.get_probs(x)
 
         bs, numleaves, numclasses = distribs.size()
-        loss = torch.zeros(bs, 1)  # bs x 1
+        loss = Variable(torch.zeros(bs, 1).cuda())  # bs x 1
 
         proba_of_true_label = distribs.gather(dim=2,
-                                              index=y.view(-1, 1, 1).expand(-1, numleaves, 1)
+                                              index=y.view(-1, 1, 1).expand(bs, numleaves, 1)
                                               ).view(bs, numleaves)  # bs x numleaves
+        proba_of_true_label = torch.clamp(proba_of_true_label, min=float(np.finfo(np.float32).eps), max=float(np.inf))
         loss = loss - torch.mul(paths_probs.view(bs, numleaves), torch.log(proba_of_true_label)).sum(dim=1)
         loss = loss.mean()
         return loss
@@ -176,11 +182,16 @@ class SoftDecisionTree(nn.Module):
     def forward(self, x):
         x = self.bn(x)
         paths_probs, distribs = self.get_probs(x)  # bs x numleaves x 1,  bs x numleaves x c
+        bs, numleaves, numclasses = distribs.size()
 
         most_probable_leaf_idx = paths_probs.max(dim=1)[1].view(-1)  # index of most probable leaf (bs)
-        result = distribs.gather(dim=1,
-                                 index=most_probable_leaf_idx.view(-1, 1, 1).expand(-1, 1, self.args.output_dim)
-                                 ).view(distribs.size()[[0, 2]])
+        expanded_idx = (
+            most_probable_leaf_idx
+            .view(-1, 1, 1)
+            .expand(most_probable_leaf_idx.size()[0], 1, self.args.output_dim)
+        )  # bs x 1 x c
+
+        result = distribs.gather(dim=1, index=expanded_idx).view(bs, numclasses)
         if self.train_mode:
             return result, paths_probs, distribs
         else:
@@ -192,23 +203,45 @@ class SoftDecisionTree(nn.Module):
         for batch_idx, (x, y) in enumerate(data_loader):
             if self.args.cuda:
                 x, y = x.cuda(), y.cuda()
+            x = x.view(x.size()[0], -1)
             x, y = Variable(x), Variable(y)
             y_est, paths_probs, distribs = self.forward(x)
             loss = (
                     self.get_primary_loss(y, paths_probs=paths_probs, distribs=distribs) +
-                    self.get_l1_reg() +
-                    self.get_penalty()
+                    # self.get_l1_reg() +
+                    self.get_penalty() +
+                    0
             )
-            loss.backward()
+
+            # # # # # # # debug
+            if np.isnan(loss.data[0]):
+                print('!' * 80)
+                print(y_est)
+                print('!' * 80)
+                print(paths_probs)
+                print('!' * 80)
+                print(distribs)
+                print('!' * 80)
+                print(self.get_primary_loss(y, paths_probs=paths_probs, distribs=distribs))
+                print('!' * 80)
+                print(self.get_penalty())
+                raise Exception('Loss is NaN suddenly!')
+            else:
+                self.prev_parameters = list(self.named_parameters())
+            # # # # # # #
+
+            self.optimizer.zero_grad()
+            loss.backward(retain_variables=True)
             if self.scheduler is None:
                 self.optimizer.step()
             else:
-                self.scheduler.step(loss.data)
+                self.scheduler.step(loss.data[0])
 
             metrics = dict()
-            metrics['loss'] = loss.data
-            metrics['accuracy'] = y.data.eq(y_est.max(dim=1)[1].data).view(-1).mean()
-            if verbose:
+            metrics['loss'] = loss.data[0]
+            metrics['accuracy'] = np.mean(y.data.eq(y_est.max(dim=1)[1].data).view(-1).cpu().numpy())
+
+            if verbose and not (batch_idx % self.args.log_interval):
                 info = "batch {:d}\t-\tLoss: {:.4f}\t-\tAccuracy: {:.3f}".format(
                     batch_idx,
                     metrics['loss'],
@@ -229,6 +262,7 @@ class SoftDecisionTree(nn.Module):
         for x, y in data_loader:
             if self.args.cuda:
                 x, y = x.cuda(), y.cuda()
+            x = x.view(x.size()[0], -1)
             x, y = Variable(x), Variable(y)
             y_est = self.forward(x)
             predicted_labels.extend(y_est.max(1)[1].data.view(-1).cpu().numpy())
