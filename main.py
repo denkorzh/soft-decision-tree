@@ -31,8 +31,10 @@ parser.add_argument('--no-cuda', action='store_true', default=False,
                     help='disables CUDA training')
 parser.add_argument('--seed', type=int, default=1, metavar='S',
                     help='random seed (default: 1)')
-parser.add_argument('--log-interval', type=int, default=10, metavar='N',
+parser.add_argument('--log-interval', type=int, default=100, metavar='N',
                     help='how many batches to wait before logging training status')
+parser.add_argument('--l1-const', type=float, default=0.001, metavar='N',
+                    help='Initial L1 const')
 
 args = parser.parse_args()
 args.cuda = not args.no_cuda and torch.cuda.is_available()
@@ -50,7 +52,7 @@ if hasattr(trainset, 'weights'):
 
 train_loader = DataLoader(dataset=trainset,
                           batch_size=args.batch_size,
-                          shuffle=(smplr is not None),
+                          shuffle=(smplr is None),
                           sampler=smplr,
                           **kwargs)
 
@@ -81,4 +83,7 @@ if args.cuda:
 #     model.test_(test_loader, epoch)
 
 for epoch in range(args.epochs):
-    print('')
+    print('Epoch {:d}'.format(epoch))
+    model.train_epoch(train_loader)
+    model.print_test_metrics(test_loader)
+    print('=' * 80)
