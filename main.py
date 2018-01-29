@@ -5,6 +5,8 @@ import pickle
 import torch
 from torch.utils.data import DataLoader, sampler
 from datum import trainset, testset
+from newmodel import save_losses
+from tensorboardX import SummaryWriter
 
 # from model import SoftDecisionTree
 from newmodel import SoftDecisionTree
@@ -33,8 +35,12 @@ parser.add_argument('--seed', type=int, default=1, metavar='S',
                     help='random seed (default: 1)')
 parser.add_argument('--log-interval', type=int, default=100, metavar='N',
                     help='how many batches to wait before logging training status')
-parser.add_argument('--l1-const', type=float, default=0.001, metavar='N',
+parser.add_argument('--l1-const', type=float, default=-10, metavar='N',
                     help='Initial L1 const')
+parser.add_argument('--l1-mode', type=str, default='learnable', metavar='N',
+                    help='L1 const handling')
+parser.add_argument('--mode', type=str, default='argmax', metavar='N',
+                    help='method of prediction')
 
 args = parser.parse_args()
 args.cuda = not args.no_cuda and torch.cuda.is_available()
@@ -82,8 +88,12 @@ if args.cuda:
 #     model.train_(train_loader, epoch)
 #     model.test_(test_loader, epoch)
 
+writer = SummaryWriter('./logs/summary.txt')
 for epoch in range(args.epochs):
     print('Epoch {:d}'.format(epoch))
     model.train_epoch(train_loader)
-    model.print_test_metrics(test_loader)
+    print('Alpha = {}'.format(model.alpha))
+    losses = model.print_test_metrics(test_loader)
+    save_losses('test', losses, writer, epoch)
     print('=' * 80)
+writer.close()
